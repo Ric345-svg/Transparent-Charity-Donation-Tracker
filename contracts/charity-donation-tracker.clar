@@ -6,8 +6,26 @@
 (define-constant ERR_CAMPAIGN_CLOSED (err u104))
 (define-constant ERR_INVALID_MILESTONE (err u105))
 (define-constant ERR_ALREADY_DONATED (err u106))
+(define-constant ERR_INVALID_CATEGORY (err u107))
 
 (define-data-var campaign-counter uint u0)
+
+(define-map categories
+  { category-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map campaign-categories
+  { campaign-id: uint }
+  { category-id: uint }
+)
+
+(define-data-var category-counter uint u0)
 
 (define-map campaigns
   { campaign-id: uint }
@@ -55,7 +73,8 @@
   (description (string-ascii 500))
   (target-amount uint)
   (deadline uint)
-  (total-milestones uint))
+  (total-milestones uint)
+  (category-id uint))
   (let 
     (
       (campaign-id (+ (var-get campaign-counter) u1))
@@ -64,6 +83,7 @@
     (asserts! (> target-amount u0) ERR_INSUFFICIENT_FUNDS)
     (asserts! (> deadline stacks-block-height) ERR_CAMPAIGN_CLOSED)
     (asserts! (<= total-milestones u10) ERR_INVALID_MILESTONE)
+    (asserts! (is-some (map-get? categories { category-id: category-id })) ERR_INVALID_CATEGORY)
     
     (map-set campaigns
       { campaign-id: campaign-id }
@@ -87,6 +107,11 @@
     (map-set campaign-donors
       { campaign-id: campaign-id }
       { donors: (list) }
+    )
+    
+    (map-set campaign-categories
+      { campaign-id: campaign-id }
+      { category-id: category-id }
     )
     
     (ok campaign-id)
@@ -275,4 +300,57 @@
     campaign (get raised-amount campaign)
     u0
   )
+)
+
+(define-public (create-category 
+  (name (string-ascii 50))
+  (description (string-ascii 200)))
+  (let 
+    (
+      (category-id (+ (var-get category-counter) u1))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    (map-set categories
+      { category-id: category-id }
+      {
+        name: name,
+        description: description,
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set category-counter category-id)
+    (ok category-id)
+  )
+)
+
+(define-public (deactivate-category (category-id uint))
+  (let 
+    (
+      (category (unwrap! (map-get? categories { category-id: category-id }) ERR_INVALID_CATEGORY))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active category) ERR_INVALID_CATEGORY)
+    
+    (map-set categories
+      { category-id: category-id }
+      (merge category { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-category (category-id uint))
+  (map-get? categories { category-id: category-id })
+)
+
+(define-read-only (get-campaign-category (campaign-id uint))
+  (map-get? campaign-categories { campaign-id: campaign-id })
+)
+
+(define-read-only (get-category-count)
+  (var-get category-counter)
 )

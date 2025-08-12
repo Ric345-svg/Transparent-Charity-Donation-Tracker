@@ -7,6 +7,7 @@
 (define-constant ERR_INVALID_MILESTONE (err u105))
 (define-constant ERR_ALREADY_DONATED (err u106))
 (define-constant ERR_INVALID_CATEGORY (err u107))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u108))
 
 (define-data-var campaign-counter uint u0)
 
@@ -67,6 +68,28 @@
   { donors: (list 100 principal) }
 )
 
+(define-map user-reputation
+  { user: principal }
+  {
+    total-campaigns: uint,
+    completed-campaigns: uint,
+    successful-campaigns: uint,
+    total-funds-raised: uint,
+    reputation-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map reputation-history
+  { user: principal, campaign-id: uint }
+  {
+    milestone-completion-rate: uint,
+    funding-success-rate: uint,
+    deadline-met: bool,
+    reputation-impact: int
+  }
+)
+
 (define-public (create-campaign 
   (beneficiary principal)
   (title (string-ascii 100))
@@ -84,6 +107,8 @@
     (asserts! (> deadline stacks-block-height) ERR_CAMPAIGN_CLOSED)
     (asserts! (<= total-milestones u10) ERR_INVALID_MILESTONE)
     (asserts! (is-some (map-get? categories { category-id: category-id })) ERR_INVALID_CATEGORY)
+    
+    (update-user-reputation-on-create tx-sender)
     
     (map-set campaigns
       { campaign-id: campaign-id }
@@ -207,6 +232,8 @@
       })
     )
     
+    (update-reputation-on-milestone campaign-id (get owner campaign))
+    
     (ok true)
   )
 )
@@ -239,6 +266,8 @@
       { campaign-id: campaign-id }
       (merge campaign { is-active: false })
     )
+    
+    (finalize-campaign-reputation campaign-id (get owner campaign))
     
     (ok true)
   )
@@ -353,4 +382,149 @@
 
 (define-read-only (get-category-count)
   (var-get category-counter)
+)
+
+(define-private (update-user-reputation-on-create (user principal))
+  (let 
+    (
+      (current-reputation (default-to 
+        { 
+          total-campaigns: u0, 
+          completed-campaigns: u0, 
+          successful-campaigns: u0, 
+          total-funds-raised: u0, 
+          reputation-score: u500, 
+          last-updated: stacks-block-height 
+        } 
+        (map-get? user-reputation { user: user })
+      ))
+    )
+    (map-set user-reputation
+      { user: user }
+      (merge current-reputation { 
+        total-campaigns: (+ (get total-campaigns current-reputation) u1),
+        last-updated: stacks-block-height
+      })
+    )
+    true
+  )
+)
+
+(define-private (update-reputation-on-milestone (campaign-id uint) (user principal))
+  (match (map-get? campaigns { campaign-id: campaign-id })
+    campaign (let
+      (
+        (current-reputation (default-to 
+          { 
+            total-campaigns: u0, 
+            completed-campaigns: u0, 
+            successful-campaigns: u0, 
+            total-funds-raised: u0, 
+            reputation-score: u500, 
+            last-updated: stacks-block-height 
+          } 
+          (map-get? user-reputation { user: user })
+        ))
+        (milestone-completion-rate (/ (* (get completed-milestones campaign) u100) (get total-milestones campaign)))
+        (reputation-boost (if (> milestone-completion-rate u80) u10 u5))
+      )
+      (map-set user-reputation
+        { user: user }
+        (merge current-reputation { 
+          reputation-score: (+ (get reputation-score current-reputation) reputation-boost),
+          last-updated: stacks-block-height
+        })
+      )
+      true
+    )
+    false
+  )
+)
+
+(define-private (finalize-campaign-reputation (campaign-id uint) (user principal))
+  (match (map-get? campaigns { campaign-id: campaign-id })
+    campaign (let
+      (
+        (current-reputation (default-to 
+          { 
+            total-campaigns: u0, 
+            completed-campaigns: u0, 
+            successful-campaigns: u0, 
+            total-funds-raised: u0, 
+            reputation-score: u500, 
+            last-updated: stacks-block-height 
+          } 
+          (map-get? user-reputation { user: user })
+        ))
+        (is-successful (>= (get raised-amount campaign) (get target-amount campaign)))
+        (milestone-completion-rate (/ (* (get completed-milestones campaign) u100) (get total-milestones campaign)))
+        (funding-success-rate (/ (* (get raised-amount campaign) u100) (get target-amount campaign)))
+        (deadline-met (< stacks-block-height (get deadline campaign)))
+        (reputation-impact (+ 
+          (if is-successful 50 -20)
+          (if (> milestone-completion-rate u80) 30 -10)
+          (if deadline-met 20 -15)
+        ))
+        (new-score (if (< reputation-impact 0)
+          (if (> (get reputation-score current-reputation) (to-uint (- 0 reputation-impact)))
+            (- (get reputation-score current-reputation) (to-uint (- 0 reputation-impact)))
+            u0)
+          (+ (get reputation-score current-reputation) (to-uint reputation-impact))))
+      )
+      (map-set user-reputation
+        { user: user }
+        (merge current-reputation { 
+          completed-campaigns: (+ (get completed-campaigns current-reputation) u1),
+          successful-campaigns: (+ (get successful-campaigns current-reputation) (if is-successful u1 u0)),
+          total-funds-raised: (+ (get total-funds-raised current-reputation) (get raised-amount campaign)),
+          reputation-score: new-score,
+          last-updated: stacks-block-height
+        })
+      )
+      
+      (map-set reputation-history
+        { user: user, campaign-id: campaign-id }
+        {
+          milestone-completion-rate: milestone-completion-rate,
+          funding-success-rate: funding-success-rate,
+          deadline-met: deadline-met,
+          reputation-impact: reputation-impact
+        }
+      )
+      
+      true
+    )
+    false
+  )
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation { user: user })
+)
+
+(define-read-only (get-reputation-history (user principal) (campaign-id uint))
+  (map-get? reputation-history { user: user, campaign-id: campaign-id })
+)
+
+(define-read-only (calculate-reputation-score (user principal))
+  (match (map-get? user-reputation { user: user })
+    reputation (some {
+      base-score: (get reputation-score reputation),
+      success-rate: (if (> (get total-campaigns reputation) u0) 
+        (/ (* (get successful-campaigns reputation) u100) (get total-campaigns reputation)) 
+        u0),
+      completion-rate: (if (> (get total-campaigns reputation) u0) 
+        (/ (* (get completed-campaigns reputation) u100) (get total-campaigns reputation)) 
+        u0),
+      total-impact: (get total-funds-raised reputation)
+    })
+    none
+  )
+)
+
+(define-read-only (is-reputable-user (user principal) (min-score uint))
+  (match (map-get? user-reputation { user: user })
+    reputation (>= (get reputation-score reputation) min-score)
+    false
+  )
 )

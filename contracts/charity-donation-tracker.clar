@@ -8,8 +8,10 @@
 (define-constant ERR_ALREADY_DONATED (err u106))
 (define-constant ERR_INVALID_CATEGORY (err u107))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u108))
+(define-constant ERR_UPDATE_NOT_FOUND (err u109))
 
 (define-data-var campaign-counter uint u0)
+(define-data-var update-counter uint u0)
 
 (define-map categories
   { category-id: uint }
@@ -90,6 +92,31 @@
   }
 )
 
+(define-map campaign-updates
+  { campaign-id: uint, update-id: uint }
+  {
+    title: (string-ascii 100),
+    content: (string-ascii 500),
+    update-type: (string-ascii 20),
+    created-at: uint,
+    is-important: bool
+  }
+)
+
+(define-map campaign-update-count
+  { campaign-id: uint }
+  { count: uint }
+)
+
+(define-map user-subscriptions
+  { campaign-id: uint, subscriber: principal }
+  {
+    subscribed-at: uint,
+    notify-all: bool,
+    notify-important: bool
+  }
+)
+
 (define-public (create-campaign 
   (beneficiary principal)
   (title (string-ascii 100))
@@ -137,6 +164,11 @@
     (map-set campaign-categories
       { campaign-id: campaign-id }
       { category-id: category-id }
+    )
+    
+    (map-set campaign-update-count
+      { campaign-id: campaign-id }
+      { count: u0 }
     )
     
     (ok campaign-id)
@@ -201,6 +233,15 @@
     (map-set campaigns
       { campaign-id: campaign-id }
       (merge campaign { raised-amount: (+ (get raised-amount campaign) amount) })
+    )
+    
+    (map-set user-subscriptions
+      { campaign-id: campaign-id, subscriber: tx-sender }
+      {
+        subscribed-at: stacks-block-height,
+        notify-all: true,
+        notify-important: true
+      }
     )
     
     (ok true)
@@ -527,4 +568,85 @@
     reputation (>= (get reputation-score reputation) min-score)
     false
   )
+)
+
+(define-public (post-campaign-update 
+  (campaign-id uint)
+  (title (string-ascii 100))
+  (content (string-ascii 500))
+  (update-type (string-ascii 20))
+  (is-important bool))
+  (let 
+    (
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (current-count (default-to { count: u0 } (map-get? campaign-update-count { campaign-id: campaign-id })))
+      (update-id (+ (get count current-count) u1))
+      (global-update-id (+ (var-get update-counter) u1))
+    )
+    (asserts! (is-eq tx-sender (get owner campaign)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_CLOSED)
+    
+    (map-set campaign-updates
+      { campaign-id: campaign-id, update-id: update-id }
+      {
+        title: title,
+        content: content,
+        update-type: update-type,
+        created-at: stacks-block-height,
+        is-important: is-important
+      }
+    )
+    
+    (map-set campaign-update-count
+      { campaign-id: campaign-id }
+      { count: update-id }
+    )
+    
+    (var-set update-counter global-update-id)
+    
+    (ok update-id)
+  )
+)
+
+(define-public (subscribe-to-updates (campaign-id uint) (notify-all bool) (notify-important bool))
+  (let 
+    (
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+    )
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_CLOSED)
+    
+    (map-set user-subscriptions
+      { campaign-id: campaign-id, subscriber: tx-sender }
+      {
+        subscribed-at: stacks-block-height,
+        notify-all: notify-all,
+        notify-important: notify-important
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (unsubscribe-from-updates (campaign-id uint))
+  (begin
+    (map-delete user-subscriptions { campaign-id: campaign-id, subscriber: tx-sender })
+    (ok true)
+  )
+)
+
+(define-read-only (get-campaign-update (campaign-id uint) (update-id uint))
+  (map-get? campaign-updates { campaign-id: campaign-id, update-id: update-id })
+)
+
+(define-read-only (get-campaign-update-count (campaign-id uint))
+  (map-get? campaign-update-count { campaign-id: campaign-id })
+)
+
+(define-read-only (get-user-subscription (campaign-id uint) (subscriber principal))
+  (map-get? user-subscriptions { campaign-id: campaign-id, subscriber: subscriber })
+)
+
+(define-read-only (is-subscribed-to-campaign (campaign-id uint) (subscriber principal))
+  (is-some (map-get? user-subscriptions { campaign-id: campaign-id, subscriber: subscriber }))
 )

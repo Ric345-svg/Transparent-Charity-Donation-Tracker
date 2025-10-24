@@ -9,9 +9,13 @@
 (define-constant ERR_INVALID_CATEGORY (err u107))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u108))
 (define-constant ERR_UPDATE_NOT_FOUND (err u109))
+(define-constant ERR_MATCHING_POOL_NOT_FOUND (err u110))
+(define-constant ERR_MATCHING_POOL_EXHAUSTED (err u111))
+(define-constant ERR_MATCHING_POOL_EXISTS (err u112))
 
 (define-data-var campaign-counter uint u0)
 (define-data-var update-counter uint u0)
+(define-data-var matching-pool-counter uint u0)
 
 (define-map categories
   { category-id: uint }
@@ -114,6 +118,40 @@
     subscribed-at: uint,
     notify-all: bool,
     notify-important: bool
+  }
+)
+
+(define-map matching-pools
+  { campaign-id: uint }
+  {
+    sponsor: principal,
+    pool-amount: uint,
+    remaining-amount: uint,
+    match-ratio-numerator: uint,
+    match-ratio-denominator: uint,
+    max-match-per-donation: uint,
+    total-matched: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map matched-donations
+  { campaign-id: uint, donor: principal }
+  {
+    original-amount: uint,
+    matched-amount: uint,
+    total-impact: uint,
+    matched-at: uint
+  }
+)
+
+(define-map campaign-matching-stats
+  { campaign-id: uint }
+  {
+    total-donors-matched: uint,
+    total-matched-funds: uint,
+    average-match-per-donor: uint
   }
 )
 
@@ -649,4 +687,298 @@
 
 (define-read-only (is-subscribed-to-campaign (campaign-id uint) (subscriber principal))
   (is-some (map-get? user-subscriptions { campaign-id: campaign-id, subscriber: subscriber }))
+)
+
+(define-public (create-matching-pool
+  (campaign-id uint)
+  (pool-amount uint)
+  (match-ratio-numerator uint)
+  (match-ratio-denominator uint)
+  (max-match-per-donation uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (existing-pool (map-get? matching-pools { campaign-id: campaign-id }))
+    )
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_CLOSED)
+    (asserts! (is-none existing-pool) ERR_MATCHING_POOL_EXISTS)
+    (asserts! (> pool-amount u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> match-ratio-numerator u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> match-ratio-denominator u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> max-match-per-donation u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (stx-transfer? pool-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      {
+        sponsor: tx-sender,
+        pool-amount: pool-amount,
+        remaining-amount: pool-amount,
+        match-ratio-numerator: match-ratio-numerator,
+        match-ratio-denominator: match-ratio-denominator,
+        max-match-per-donation: max-match-per-donation,
+        total-matched: u0,
+        is-active: true,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (map-set campaign-matching-stats
+      { campaign-id: campaign-id }
+      {
+        total-donors-matched: u0,
+        total-matched-funds: u0,
+        average-match-per-donor: u0
+      }
+    )
+    
+    (var-set matching-pool-counter (+ (var-get matching-pool-counter) u1))
+    
+    (ok true)
+  )
+)
+
+(define-public (donate-with-matching (campaign-id uint) (amount uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (existing-donation (map-get? donations { campaign-id: campaign-id, donor: tx-sender }))
+      (current-donors (default-to { donors: (list) } (map-get? campaign-donors { campaign-id: campaign-id })))
+      (matching-pool (map-get? matching-pools { campaign-id: campaign-id }))
+    )
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_CLOSED)
+    (asserts! (< stacks-block-height (get deadline campaign)) ERR_CAMPAIGN_CLOSED)
+    (asserts! (> amount u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (is-none existing-donation) ERR_ALREADY_DONATED)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (let
+      (
+        (matching-result (match matching-pool
+          pool (if (get is-active pool)
+            (calculate-and-apply-match campaign-id amount pool)
+            { matched-amount: u0, updated-pool: none })
+          { matched-amount: u0, updated-pool: none }))
+        (matched-amount (get matched-amount matching-result))
+        (total-impact (+ amount matched-amount))
+      )
+      
+      (map-set donations
+        { campaign-id: campaign-id, donor: tx-sender }
+        {
+          amount: amount,
+          donated-at: stacks-block-height
+        }
+      )
+      
+      (if (> matched-amount u0)
+        (map-set matched-donations
+          { campaign-id: campaign-id, donor: tx-sender }
+          {
+            original-amount: amount,
+            matched-amount: matched-amount,
+            total-impact: total-impact,
+            matched-at: stacks-block-height
+          }
+        )
+        true
+      )
+      
+      (map-set campaign-donors
+        { campaign-id: campaign-id }
+        { donors: (unwrap! (as-max-len? (append (get donors current-donors) tx-sender) u100) ERR_INSUFFICIENT_FUNDS) }
+      )
+      
+      (map-set campaigns
+        { campaign-id: campaign-id }
+        (merge campaign { raised-amount: (+ (get raised-amount campaign) total-impact) })
+      )
+      
+      (map-set user-subscriptions
+        { campaign-id: campaign-id, subscriber: tx-sender }
+        {
+          subscribed-at: stacks-block-height,
+          notify-all: true,
+          notify-important: true
+        }
+      )
+      
+      (ok { donated: amount, matched: matched-amount, total: total-impact })
+    )
+  )
+)
+
+(define-private (calculate-and-apply-match
+  (campaign-id uint)
+  (donation-amount uint)
+  (pool {sponsor: principal, pool-amount: uint, remaining-amount: uint, match-ratio-numerator: uint, match-ratio-denominator: uint, max-match-per-donation: uint, total-matched: uint, is-active: bool, created-at: uint}))
+  (let
+    (
+      (calculated-match (/ (* donation-amount (get match-ratio-numerator pool)) (get match-ratio-denominator pool)))
+      (capped-match (if (> calculated-match (get max-match-per-donation pool))
+        (get max-match-per-donation pool)
+        calculated-match))
+      (final-match (if (> capped-match (get remaining-amount pool))
+        (get remaining-amount pool)
+        capped-match))
+      (new-remaining (- (get remaining-amount pool) final-match))
+      (new-total-matched (+ (get total-matched pool) final-match))
+      (stats (default-to { total-donors-matched: u0, total-matched-funds: u0, average-match-per-donor: u0 } (map-get? campaign-matching-stats { campaign-id: campaign-id })))
+      (new-donor-count (+ (get total-donors-matched stats) u1))
+      (new-total-matched-funds (+ (get total-matched-funds stats) final-match))
+    )
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      (merge pool {
+        remaining-amount: new-remaining,
+        total-matched: new-total-matched,
+        is-active: (> new-remaining u0)
+      })
+    )
+    
+    (map-set campaign-matching-stats
+      { campaign-id: campaign-id }
+      {
+        total-donors-matched: new-donor-count,
+        total-matched-funds: new-total-matched-funds,
+        average-match-per-donor: (/ new-total-matched-funds new-donor-count)
+      }
+    )
+    
+    { matched-amount: final-match, updated-pool: (some pool) }
+  )
+)
+
+(define-public (top-up-matching-pool (campaign-id uint) (additional-amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? matching-pools { campaign-id: campaign-id }) ERR_MATCHING_POOL_NOT_FOUND))
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get sponsor pool)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_CLOSED)
+    (asserts! (> additional-amount u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      (merge pool {
+        pool-amount: (+ (get pool-amount pool) additional-amount),
+        remaining-amount: (+ (get remaining-amount pool) additional-amount),
+        is-active: true
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-matching-pool (campaign-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? matching-pools { campaign-id: campaign-id }) ERR_MATCHING_POOL_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get sponsor pool)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active pool) ERR_MATCHING_POOL_EXHAUSTED)
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      (merge pool { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (reclaim-unused-matching-funds (campaign-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? matching-pools { campaign-id: campaign-id }) ERR_MATCHING_POOL_NOT_FOUND))
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get sponsor pool)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-active campaign)) ERR_CAMPAIGN_CLOSED)
+    (asserts! (> (get remaining-amount pool) u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? (get remaining-amount pool) tx-sender (get sponsor pool))))
+    
+    (map-set matching-pools
+      { campaign-id: campaign-id }
+      (merge pool {
+        remaining-amount: u0,
+        is-active: false
+      })
+    )
+    
+    (ok (get remaining-amount pool))
+  )
+)
+
+(define-read-only (get-matching-pool (campaign-id uint))
+  (map-get? matching-pools { campaign-id: campaign-id })
+)
+
+(define-read-only (get-matched-donation (campaign-id uint) (donor principal))
+  (map-get? matched-donations { campaign-id: campaign-id, donor: donor })
+)
+
+(define-read-only (get-campaign-matching-stats (campaign-id uint))
+  (map-get? campaign-matching-stats { campaign-id: campaign-id })
+)
+
+(define-read-only (calculate-potential-match (campaign-id uint) (donation-amount uint))
+  (match (map-get? matching-pools { campaign-id: campaign-id })
+    pool (if (get is-active pool)
+      (let
+        (
+          (calculated-match (/ (* donation-amount (get match-ratio-numerator pool)) (get match-ratio-denominator pool)))
+          (capped-match (if (> calculated-match (get max-match-per-donation pool))
+            (get max-match-per-donation pool)
+            calculated-match))
+          (final-match (if (> capped-match (get remaining-amount pool))
+            (get remaining-amount pool)
+            capped-match))
+        )
+        (some {
+          donation-amount: donation-amount,
+          matched-amount: final-match,
+          total-impact: (+ donation-amount final-match),
+          match-ratio: (get match-ratio-numerator pool),
+          remaining-pool: (get remaining-amount pool)
+        })
+      )
+      none)
+    none
+  )
+)
+
+(define-read-only (get-matching-pool-status (campaign-id uint))
+  (match (map-get? matching-pools { campaign-id: campaign-id })
+    pool (some {
+      has-pool: true,
+      is-active: (get is-active pool),
+      remaining-amount: (get remaining-amount pool),
+      utilization-rate: (if (> (get pool-amount pool) u0)
+        (/ (* (get total-matched pool) u100) (get pool-amount pool))
+        u0),
+      total-matched: (get total-matched pool),
+      sponsor: (get sponsor pool)
+    })
+    (some {
+      has-pool: false,
+      is-active: false,
+      remaining-amount: u0,
+      utilization-rate: u0,
+      total-matched: u0,
+      sponsor: CONTRACT_OWNER
+    })
+  )
+)
+
+(define-read-only (get-matching-pool-count)
+  (var-get matching-pool-counter)
 )

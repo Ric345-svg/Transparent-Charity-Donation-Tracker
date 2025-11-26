@@ -982,3 +982,66 @@
 (define-read-only (get-matching-pool-count)
   (var-get matching-pool-counter)
 )
+
+;; Community Governance Features
+
+(define-constant ERR_NOT_A_DONOR (err u113))
+(define-constant ERR_ALREADY_VOTED (err u114))
+
+(define-map shutdown-votes
+  { campaign-id: uint, voter: principal }
+  { voted: bool }
+)
+
+(define-map campaign-vote-count
+  { campaign-id: uint }
+  { count: uint }
+)
+
+(define-public (vote-to-shutdown (campaign-id uint))
+  (let
+    (
+      (campaign (unwrap! (map-get? campaigns { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))
+      (is-donor (is-some (map-get? donations { campaign-id: campaign-id, donor: tx-sender })))
+      (has-voted (default-to false (get voted (map-get? shutdown-votes { campaign-id: campaign-id, voter: tx-sender }))))
+      (current-votes (default-to u0 (get count (map-get? campaign-vote-count { campaign-id: campaign-id }))))
+      (total-donors (len (get donors (unwrap! (map-get? campaign-donors { campaign-id: campaign-id }) ERR_CAMPAIGN_NOT_FOUND))))
+      (new-vote-count (+ current-votes u1))
+    )
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_CLOSED)
+    (asserts! is-donor ERR_NOT_A_DONOR)
+    (asserts! (not has-voted) ERR_ALREADY_VOTED)
+
+    (map-set shutdown-votes
+      { campaign-id: campaign-id, voter: tx-sender }
+      { voted: true }
+    )
+
+    (map-set campaign-vote-count
+      { campaign-id: campaign-id }
+      { count: new-vote-count }
+    )
+
+    ;; Close campaign if votes > 50% of donors
+    (if (> (* new-vote-count u2) total-donors)
+      (map-set campaigns
+        { campaign-id: campaign-id }
+        (merge campaign { is-active: false })
+      )
+      false
+    )
+
+    (ok true)
+  )
+)
+
+(define-read-only (get-campaign-vote-stats (campaign-id uint))
+  (let
+    (
+      (votes (default-to u0 (get count (map-get? campaign-vote-count { campaign-id: campaign-id }))))
+      (donors-data (default-to { donors: (list) } (map-get? campaign-donors { campaign-id: campaign-id })))
+      (total-donors (len (get donors donors-data)))
+    )
+    { votes: votes, total-donors: total-donors }
+  )
+)
